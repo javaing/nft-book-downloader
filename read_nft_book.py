@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-3ook.com NFT Book Downloader
-給定任一 OpenSea NFT URL，用錢包驗證持有並下載 epub
+3ook.com NFT Book Downloader + AI 重點整理
+給定任一 OpenSea NFT URL，用錢包驗證持有、下載 epub，並可選擇送 Claude 整理重點
 
 用法:
   PRIVATE_KEY=0x... python3 read_nft_book.py <opensea_url>
-  PRIVATE_KEY=0x... python3 read_nft_book.py <opensea_url> --token-id 5
-  PRIVATE_KEY=0x... python3 read_nft_book.py <opensea_url> --output book.epub
+  PRIVATE_KEY=0x... python3 read_nft_book.py <opensea_url> --summarize
+  PRIVATE_KEY=0x... python3 read_nft_book.py <opensea_url> --summarize --summary-only
 
-OpenSea URL 範例:
-  https://opensea.io/assets/base/0x67018c5ff51e2c84badb13e15e4dad6d32d3498e/0
+  # 只整理已下載的 epub（不重新下載）
+  PRIVATE_KEY=0x... python3 read_nft_book.py <opensea_url> --summarize --summary-only
+
+  # 需要設定：
+  #   PRIVATE_KEY   — 錢包私鑰
+  #   ANTHROPIC_API_KEY — Claude API 金鑰（使用 --summarize 時需要）
 
 安全提醒: 使用環境變數傳入私鑰，避免出現在 shell 歷史記錄中
 """
@@ -23,6 +27,8 @@ import time
 import urllib.request
 import urllib.parse
 import argparse
+import zipfile
+from html.parser import HTMLParser
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -260,22 +266,163 @@ def download_epub(class_id, nft_id, jwt_token, index=0, output_path=None):
     return output_path
 
 
+# ── epub 文字擷取 ─────────────────────────────────────────────────────────────
+
+class _TextExtractor(HTMLParser):
+    """把 XHTML 轉為純文字，保留段落與標題結構"""
+    SKIP = {'script', 'style', 'head'}
+    BLOCK = {'p', 'div', 'li', 'br', 'tr'}
+    HEADING = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t in self.SKIP:
+            self._skip = True
+        elif t in self.HEADING:
+            self.parts.append('\n\n### ')
+        elif t in self.BLOCK:
+            self.parts.append('\n')
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t in self.SKIP:
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            text = data.strip()
+            if text:
+                self.parts.append(text + ' ')
+
+    def get_text(self):
+        return ''.join(self.parts)
+
+
+def extract_epub_text(epub_path, max_chars=300_000):
+    """
+    從 epub 解壓並擷取純文字，依 spine 順序合併各章節。
+    max_chars 限制最大字元數（約 150K 繁體字 ≈ 200K tokens）。
+    """
+    with zipfile.ZipFile(epub_path, 'r') as z:
+        # 1. 找 OPF 路徑
+        container = z.read('META-INF/container.xml').decode('utf-8', errors='ignore')
+        m = re.search(r'full-path="([^"]+\.opf)"', container)
+        if not m:
+            raise RuntimeError("找不到 OPF 檔案")
+        opf_path = m.group(1)
+        opf_dir = '/'.join(opf_path.split('/')[:-1])
+        opf = z.read(opf_path).decode('utf-8', errors='ignore')
+
+        # 2. manifest id → href
+        manifest = {}
+        for item in re.finditer(
+                r'<item\b[^>]+\bid="([^"]+)"[^>]+\bhref="([^"]+)"', opf):
+            manifest[item.group(1)] = item.group(2)
+
+        # 3. spine 順序
+        spine_ids = re.findall(r'<itemref\b[^>]+\bidref="([^"]+)"', opf)
+
+        # 4. 逐章擷取
+        chapters = []
+        total = 0
+        for sid in spine_ids:
+            href = manifest.get(sid)
+            if not href:
+                continue
+            fp = f"{opf_dir}/{href}" if opf_dir else href
+            try:
+                html = z.read(fp).decode('utf-8', errors='ignore')
+            except KeyError:
+                continue
+            parser = _TextExtractor()
+            parser.feed(html)
+            text = re.sub(r'\n{3,}', '\n\n', parser.get_text()).strip()
+            if text:
+                chapters.append(text)
+                total += len(text)
+                if total >= max_chars:
+                    break
+
+    full = '\n\n---\n\n'.join(chapters)
+    return full[:max_chars]
+
+
+# ── Claude AI 整理 ────────────────────────────────────────────────────────────
+
+def summarize_with_claude(epub_text, book_name, api_key=None):
+    """
+    將 epub 文字送給 Claude Opus，以串流方式輸出整理重點，
+    並儲存為 Markdown 檔案。
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    char_count = len(epub_text)
+    print(f"   書本文字: {char_count:,} 字元，傳送至 Claude 分析中...\n")
+
+    prompt = f"""以下是《{book_name}》的完整內容，請用**繁體中文**為我整理：
+
+1. **核心主題** — 這本書在講什麼（2-3 句話）
+2. **作者核心觀點** — 作者最重要的論述（條列）
+3. **章節重點摘要** — 依章節順序，每章 2-5 個要點
+4. **關鍵概念與詞彙** — 書中重要概念的簡要解釋
+5. **最值得思考的洞見** — 你認為最深刻或最具啟發性的段落或觀點
+6. **延伸閱讀建議** — 若想深入了解，可以閱讀哪些相關主題
+
+---
+書本內容：
+
+{epub_text}"""
+
+    summary_parts = []
+
+    with client.messages.stream(
+        model="claude-opus-4-6",
+        max_tokens=8000,
+        thinking={"type": "adaptive"},
+        system="你是一位優秀的書籍分析師，熟悉中文非虛構類寫作。請用清晰的繁體中文 Markdown 格式回應。",
+        messages=[{"role": "user", "content": prompt}]
+    ) as stream:
+        for chunk in stream.text_stream:
+            print(chunk, end="", flush=True)
+            summary_parts.append(chunk)
+
+    print("\n")
+    return ''.join(summary_parts)
+
+
 # ── 主程式 ────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="3ook.com NFT Book Downloader")
+    parser = argparse.ArgumentParser(description="3ook.com NFT Book Downloader + AI 重點整理")
     parser.add_argument("url", help="OpenSea NFT URL")
     parser.add_argument("--token-id", type=int, default=None,
                         help="指定你持有的 Token ID（不指定時自動查詢）")
     parser.add_argument("--index", type=int, default=0,
                         help="書本檔案索引，預設 0")
     parser.add_argument("--output", default=None, help="輸出 epub 路徑")
+    parser.add_argument("--summarize", action="store_true",
+                        help="下載後用 Claude 整理重點（需要 ANTHROPIC_API_KEY）")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="只整理重點，跳過下載（epub 須已存在）")
     args = parser.parse_args()
 
     private_key = os.environ.get("PRIVATE_KEY")
-    if not private_key:
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    if not private_key and not args.summary_only:
         print("錯誤: 請設定 PRIVATE_KEY 環境變數")
         print("範例: PRIVATE_KEY=0x私鑰 python3 read_nft_book.py <url>")
+        sys.exit(1)
+
+    if (args.summarize or args.summary_only) and not anthropic_key:
+        print("錯誤: 使用 --summarize 需要設定 ANTHROPIC_API_KEY 環境變數")
         sys.exit(1)
 
     # 解析 OpenSea URL
@@ -323,17 +470,38 @@ def main():
             sys.exit(1)
         print(f"   找到 Token ID: {nft_id}")
 
-    # Step 4: 下載
-    print(f"4. 下載 epub (index={args.index})...")
+    # 決定 epub 檔名
     if args.output is None and book_name:
-        # 用書名當檔名，移除不合法的路徑字元
         safe_name = re.sub(r'[\\/*?:"<>|]', "_", book_name).strip()
-        output_path = f"{safe_name}.epub"
+        epub_path = f"{safe_name}.epub"
     else:
-        output_path = args.output
-    output = download_epub(class_id, nft_id, jwt,
-                           index=args.index, output_path=output_path)
-    print(f"\n完成！儲存至: {output}")
+        epub_path = args.output or f"nft_book_{class_id[-8:]}_{nft_id if 'nft_id' in dir() else 0}.epub"
+
+    # Step 4: 下載（summary-only 時略過）
+    if not args.summary_only:
+        print(f"4. 下載 epub (index={args.index})...")
+        epub_path = download_epub(class_id, nft_id, jwt,
+                                  index=args.index, output_path=epub_path)
+        print(f"\n完成！儲存至: {epub_path}")
+    else:
+        if not os.path.exists(epub_path):
+            print(f"錯誤: 找不到 epub 檔案: {epub_path}")
+            print("請先下載或用 --output 指定路徑")
+            sys.exit(1)
+        print(f"使用已存在的 epub: {epub_path}")
+
+    # Step 5: AI 整理重點
+    if args.summarize or args.summary_only:
+        print(f"\n5. Claude 整理重點...")
+        epub_text = extract_epub_text(epub_path)
+        summary = summarize_with_claude(epub_text, book_name or epub_path, api_key=anthropic_key)
+
+        # 儲存摘要
+        summary_path = re.sub(r'\.epub$', '_重點整理.md', epub_path)
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write(f"# 《{book_name}》重點整理\n\n")
+            f.write(summary)
+        print(f"摘要已儲存至: {summary_path}")
 
 
 if __name__ == "__main__":
