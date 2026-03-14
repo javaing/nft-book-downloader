@@ -35,6 +35,35 @@ from eth_account.messages import encode_defunct
 
 API_BASE = "https://api.like.co"
 
+
+# ── .env 載入 ─────────────────────────────────────────────────────────────────
+
+def load_dotenv(path=None):
+    """
+    讀取 .env 檔案，將 KEY=VALUE 注入 os.environ（不覆蓋已存在的環境變數）。
+    搜尋順序：指定路徑 → 腳本同目錄 → 當前工作目錄
+    """
+    candidates = []
+    if path:
+        candidates.append(path)
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    candidates.append(os.path.join(os.getcwd(), ".env"))
+
+    for fpath in candidates:
+        if not os.path.exists(fpath):
+            continue
+        with open(fpath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:   # 環境變數優先
+                    os.environ[key] = val
+        break   # 找到第一個就停
+
 # OpenSea chain name → 公開 RPC
 CHAIN_RPC = {
     "base":      "https://base-rpc.publicnode.com",
@@ -413,6 +442,7 @@ def main():
                         help="只整理重點，跳過下載（epub 須已存在）")
     args = parser.parse_args()
 
+    load_dotenv()   # 讀 .env（環境變數優先，不覆蓋）
     private_key = os.environ.get("PRIVATE_KEY")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
 
