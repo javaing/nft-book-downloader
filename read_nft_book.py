@@ -305,22 +305,33 @@ def download_epub(class_id, nft_id, jwt_token, index=0, output_path=None):
         snippet = data.decode(errors='replace')[:500]
         raise RuntimeError(f"API 回傳 HTML（可能是錯誤頁）:\n{snippet}")
 
-    # 驗證是否為 ZIP / epub（magic bytes PK\x03\x04）
-    if not data[:4] == b'PK\x03\x04':
+    # 偵測檔案類型
+    if data[:4] == b'PK\x03\x04':
+        file_type = "epub"
+    elif data[:4] == b'%PDF':
+        file_type = "pdf"
+    else:
         preview = data[:200].decode(errors='replace')
         raise RuntimeError(
-            f"下載的檔案不是有效的 epub/zip 格式（Content-Type: {content_type}）\n"
+            f"下載的檔案格式未知（Content-Type: {content_type}）\n"
             f"內容預覽: {preview}"
         )
 
     if output_path is None:
-        output_path = f"nft_book_{class_id[-8:]}_{nft_id}.epub"
+        base = f"nft_book_{class_id[-8:]}_{nft_id}"
+        output_path = f"{base}.{file_type}"
+    else:
+        # 若副檔名與實際格式不符，自動修正
+        if file_type == "pdf" and not output_path.lower().endswith(".pdf"):
+            output_path = re.sub(r'\.\w+$', '.pdf', output_path)
+        elif file_type == "epub" and not output_path.lower().endswith(".epub"):
+            output_path = re.sub(r'\.\w+$', '.epub', output_path)
 
     with open(output_path, "wb") as f:
         f.write(data)
 
     mb = len(data) / 1024 / 1024
-    print(f"   下載完成，大小: {mb:.1f} MB")
+    print(f"   下載完成，格式: {file_type.upper()}，大小: {mb:.1f} MB")
     return output_path
 
 
@@ -423,6 +434,58 @@ def extract_epub_text(epub_path, max_chars=300_000):
 
     full = '\n\n---\n\n'.join(chapters)
     return full[:max_chars]
+
+
+def extract_pdf_text(pdf_path, max_chars=300_000):
+    """
+    從 PDF 擷取純文字。
+    優先使用 pypdf（需 pip install pypdf），
+    若未安裝則嘗試 pdfminer.six，
+    再不行則用暴力 regex 掃描原始位元組（準確度較低）。
+    """
+    # 方法 1: pypdf
+    try:
+        import pypdf
+        parts = []
+        total = 0
+        with open(pdf_path, 'rb') as f:
+            reader = pypdf.PdfReader(f)
+            for page in reader.pages:
+                text = page.extract_text() or ''
+                parts.append(text)
+                total += len(text)
+                if total >= max_chars:
+                    break
+        full = '\n\n'.join(parts)
+        return full[:max_chars]
+    except ImportError:
+        pass
+
+    # 方法 2: pdfminer.six
+    try:
+        from pdfminer.high_level import extract_text as pdfminer_extract
+        text = pdfminer_extract(pdf_path)
+        return (text or '')[:max_chars]
+    except ImportError:
+        pass
+
+    # 方法 3: 暴力掃描（fallback，中文 PDF 效果有限）
+    print("   提示：安裝 pypdf 可提升 PDF 文字擷取品質：pip install pypdf")
+    with open(pdf_path, 'rb') as f:
+        raw = f.read()
+    # 抓出 BT ... ET 之間的文字串
+    chunks = re.findall(rb'\(([^\)]{1,200})\)\s*Tj', raw)
+    text = ' '.join(
+        c.decode('latin-1', errors='replace') for c in chunks
+    )
+    return text[:max_chars]
+
+
+def extract_text(file_path, max_chars=300_000):
+    """根據副檔名自動選擇 epub 或 PDF 文字擷取"""
+    if file_path.lower().endswith('.pdf'):
+        return extract_pdf_text(file_path, max_chars)
+    return extract_epub_text(file_path, max_chars)
 
 
 # ── Claude AI 整理 ────────────────────────────────────────────────────────────
@@ -544,34 +607,40 @@ def main():
             sys.exit(1)
         print(f"   找到 Token ID: {nft_id}")
 
-    # 決定 epub 檔名
+    # 決定輸出檔名（副檔名由 download_epub 依實際格式決定，先用 epub 佔位）
     if args.output is None and book_name:
         safe_name = re.sub(r'[\\/*?:"<>|]', "_", book_name).strip()
-        epub_path = f"{safe_name}.epub"
+        book_path = f"{safe_name}.epub"   # download_epub 會依格式自動修正副檔名
     else:
-        epub_path = args.output or f"nft_book_{class_id[-8:]}_{nft_id if 'nft_id' in dir() else 0}.epub"
+        book_path = args.output or f"nft_book_{class_id[-8:]}_{nft_id}.epub"
 
     # Step 4: 下載（summary-only 時略過）
     if not args.summary_only:
-        print(f"4. 下載 epub (index={args.index})...")
-        epub_path = download_epub(class_id, nft_id, jwt,
-                                  index=args.index, output_path=epub_path)
-        print(f"\n完成！儲存至: {epub_path}")
+        print(f"4. 下載書本 (index={args.index})...")
+        book_path = download_epub(class_id, nft_id, jwt,
+                                  index=args.index, output_path=book_path)
+        print(f"\n完成！儲存至: {book_path}")
     else:
-        if not os.path.exists(epub_path):
-            print(f"錯誤: 找不到 epub 檔案: {epub_path}")
-            print("請先下載或用 --output 指定路徑")
-            sys.exit(1)
-        print(f"使用已存在的 epub: {epub_path}")
+        # summary-only：嘗試找 epub 或 pdf
+        if not os.path.exists(book_path):
+            # 試試 pdf 副檔名
+            pdf_try = re.sub(r'\.epub$', '.pdf', book_path)
+            if os.path.exists(pdf_try):
+                book_path = pdf_try
+            else:
+                print(f"錯誤: 找不到書本檔案: {book_path}")
+                print("請先下載或用 --output 指定路徑")
+                sys.exit(1)
+        print(f"使用已存在的書本: {book_path}")
 
     # Step 5: AI 整理重點
     if args.summarize or args.summary_only:
         print(f"\n5. Claude 整理重點...")
-        epub_text = extract_epub_text(epub_path)
-        summary = summarize_with_claude(epub_text, book_name or epub_path, api_key=anthropic_key)
+        book_text = extract_text(book_path)
+        summary = summarize_with_claude(book_text, book_name or book_path, api_key=anthropic_key)
 
         # 儲存摘要
-        summary_path = re.sub(r'\.epub$', '_重點整理.md', epub_path)
+        summary_path = re.sub(r'\.(epub|pdf)$', '_重點整理.md', book_path)
         with open(summary_path, 'w', encoding='utf-8') as f:
             f.write(f"# 《{book_name}》重點整理\n\n")
             f.write(summary)
