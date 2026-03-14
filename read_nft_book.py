@@ -249,8 +249,21 @@ def authorize(private_key):
     return wallet, result["token"]
 
 
+def _fetch_url(url, headers=None):
+    """發出 GET 請求，回傳 (response_bytes, content_type)"""
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        resp = urllib.request.urlopen(req)
+        data = resp.read()
+        ct = resp.headers.get("Content-Type", "")
+        return data, ct
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode(errors='replace')
+        raise RuntimeError(f"HTTP {e.code}: {msg}") from e
+
+
 def download_epub(class_id, nft_id, jwt_token, index=0, output_path=None):
-    """透過 LikeCoin ebook-cors 端點下載 epub"""
+    """透過 LikeCoin ebook-cors 端點下載 epub，自動處理間接下載連結"""
     params = urllib.parse.urlencode({
         "class_id": class_id,
         "nft_id": str(nft_id),
@@ -258,40 +271,56 @@ def download_epub(class_id, nft_id, jwt_token, index=0, output_path=None):
         "custom_message": "0"
     })
     url = f"{API_BASE}/ebook-cors/?{params}"
-    req = urllib.request.Request(url, headers={
+
+    print(f"   請求: {url}")
+
+    data, content_type = _fetch_url(url, headers={
         "Authorization": f"Bearer {jwt_token}",
         "Origin": "https://liker.land",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*"
     })
 
-    try:
-        response = urllib.request.urlopen(req)
-    except urllib.error.HTTPError as e:
-        msg = e.read().decode()
-        raise RuntimeError(f"下載失敗 {e.code}: {msg}") from e
+    # 若回傳 JSON，可能是含真實下載 URL 的結構
+    ct_lower = content_type.lower()
+    if "json" in ct_lower or (data[:1] in (b'{', b'[')):
+        try:
+            obj = json.loads(data)
+            print(f"   API 回傳 JSON: {json.dumps(obj, ensure_ascii=False)[:300]}")
+            # 尋找下載連結（常見欄位）
+            epub_url = (obj.get("url") or obj.get("epub") or obj.get("downloadURL")
+                        or obj.get("download_url") or obj.get("fileURL"))
+            if not epub_url and isinstance(obj.get("urls"), list) and obj["urls"]:
+                epub_url = obj["urls"][0]
+            if epub_url:
+                print(f"   跟隨下載連結: {epub_url}")
+                data, content_type = _fetch_url(epub_url, headers={"User-Agent": "Mozilla/5.0"})
+            else:
+                raise RuntimeError(f"API 回傳 JSON 但找不到下載連結:\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
+        except json.JSONDecodeError:
+            pass
 
-    total = int(response.headers.get("x-original-content-length")
-                or response.headers.get("content-length") or 0)
+    # 若回傳 HTML（通常是錯誤頁）
+    if "html" in ct_lower or data[:15].lower().startswith(b'<!doctype'):
+        snippet = data.decode(errors='replace')[:500]
+        raise RuntimeError(f"API 回傳 HTML（可能是錯誤頁）:\n{snippet}")
+
+    # 驗證是否為 ZIP / epub（magic bytes PK\x03\x04）
+    if not data[:4] == b'PK\x03\x04':
+        preview = data[:200].decode(errors='replace')
+        raise RuntimeError(
+            f"下載的檔案不是有效的 epub/zip 格式（Content-Type: {content_type}）\n"
+            f"內容預覽: {preview}"
+        )
 
     if output_path is None:
-        output_path = f"nft_book_{class_id[-8:]}_{nft_id}.epub"  # fallback，由呼叫方覆蓋
+        output_path = f"nft_book_{class_id[-8:]}_{nft_id}.epub"
 
-    downloaded = 0
     with open(output_path, "wb") as f:
-        while True:
-            chunk = response.read(65536)
-            if not chunk:
-                break
-            f.write(chunk)
-            downloaded += len(chunk)
-            if total:
-                pct = downloaded * 100 // total
-                mb = downloaded / 1024 / 1024
-                total_mb = total / 1024 / 1024
-                print(f"\r  下載中: {pct}%  {mb:.1f} / {total_mb:.1f} MB",
-                      end="", flush=True)
+        f.write(data)
 
-    print()
+    mb = len(data) / 1024 / 1024
+    print(f"   下載完成，大小: {mb:.1f} MB")
     return output_path
 
 
@@ -337,6 +366,21 @@ def extract_epub_text(epub_path, max_chars=300_000):
     從 epub 解壓並擷取純文字，依 spine 順序合併各章節。
     max_chars 限制最大字元數（約 150K 繁體字 ≈ 200K tokens）。
     """
+    # 先驗證 magic bytes
+    with open(epub_path, 'rb') as f:
+        magic = f.read(4)
+    if magic != b'PK\x03\x04':
+        preview = open(epub_path, 'rb').read(200)
+        try:
+            preview_str = preview.decode('utf-8', errors='replace')
+        except Exception:
+            preview_str = repr(preview)
+        raise RuntimeError(
+            f"epub 檔案格式不正確（非 ZIP）。\n"
+            f"檔案開頭: {preview_str}\n"
+            f"可能是下載時取到錯誤頁面，請確認 JWT 是否有效。"
+        )
+
     with zipfile.ZipFile(epub_path, 'r') as z:
         # 1. 找 OPF 路徑
         container = z.read('META-INF/container.xml').decode('utf-8', errors='ignore')
